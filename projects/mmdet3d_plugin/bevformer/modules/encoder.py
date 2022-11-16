@@ -61,14 +61,15 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 shape (bs, num_keys, num_levels, 2).
         """
 
+        """
+        [PAPER REVIEW] 8. Reference points (Anchor points) 생성 (비어있는)
+        """
         # reference points in 3D space, used in spatial cross-attention (SCA)
         if dim == '3d':
-            zs = torch.linspace(0.5, Z - 0.5, num_points_in_pillar, dtype=dtype,
-                                device=device).view(-1, 1, 1).expand(num_points_in_pillar, H, W) / Z
-            xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype,
-                                device=device).view(1, 1, W).expand(num_points_in_pillar, H, W) / W
-            ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype,
-                                device=device).view(1, H, 1).expand(num_points_in_pillar, H, W) / H
+            zs = torch.linspace(0.5, Z - 0.5, num_points_in_pillar, dtype=dtype, device=device).view(-1, 1, 1).expand(num_points_in_pillar, H, W) / Z
+            xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device).view(1, 1, W).expand(num_points_in_pillar, H, W) / W
+            ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device).view(1, H, 1).expand(num_points_in_pillar, H, W) / H
+            
             ref_3d = torch.stack((xs, ys, zs), -1)
             ref_3d = ref_3d.permute(0, 3, 1, 2).flatten(2).permute(0, 2, 1)
             ref_3d = ref_3d[None].repeat(bs, 1, 1, 1)
@@ -77,10 +78,8 @@ class BEVFormerEncoder(TransformerLayerSequence):
         # reference points on 2D bev plane, used in temporal self-attention (TSA).
         elif dim == '2d':
             ref_y, ref_x = torch.meshgrid(
-                torch.linspace(
-                    0.5, H - 0.5, H, dtype=dtype, device=device),
-                torch.linspace(
-                    0.5, W - 0.5, W, dtype=dtype, device=device)
+                torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device),
+                torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device)
             )
             ref_y = ref_y.reshape(-1)[None] / H
             ref_x = ref_x.reshape(-1)[None] / W
@@ -92,35 +91,47 @@ class BEVFormerEncoder(TransformerLayerSequence):
     @force_fp32(apply_to=('reference_points', 'img_metas'))
     def point_sampling(self, reference_points, pc_range,  img_metas):
 
+        """
+        [PAPER REVIEW] 10.
+        중요한 변수: lidar2img, reference_points => 둘의 차이 명확히!
+        
+        In the paper, "BEVFormer relies on camera intrinsics and extrinsics to obtain reference points on 2D views"
+        => lidar2img가 그러면 camera calibration data를 다르게 나타낸 것인가? 실제 lidar point가 아니라?
+        
+        lidar2img가 어떻게 얻어지는지 확인할 필요!
+        "lidar2img (list[np.ndarray], optional): Transformations from lidar to different cameras." in nuscenes_dataset.py
+        lidar2img == LiDAR coordinate system to 6 difference camera image plane 변환을 나타내는 값 (각 4x4 matrix 즉 총 12개의 값)
+        
+        !!!!!!!!!!!!!!!(key function) BEV space의 3d ref points (총 4만개)를 각 2d camera image에 projection 
+        """
         lidar2img = []
         for img_meta in img_metas:
             lidar2img.append(img_meta['lidar2img'])
         lidar2img = np.asarray(lidar2img)
-        lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4)
+        lidar2img = reference_points.new_tensor(lidar2img) # (B, N, 4, 4)
         reference_points = reference_points.clone()
 
-        reference_points[..., 0:1] = reference_points[..., 0:1] * \
-            (pc_range[3] - pc_range[0]) + pc_range[0]
-        reference_points[..., 1:2] = reference_points[..., 1:2] * \
-            (pc_range[4] - pc_range[1]) + pc_range[1]
-        reference_points[..., 2:3] = reference_points[..., 2:3] * \
-            (pc_range[5] - pc_range[2]) + pc_range[2]
+        reference_points[..., 0:1] = reference_points[..., 0:1] * (pc_range[3] - pc_range[0]) + pc_range[0]
+        reference_points[..., 1:2] = reference_points[..., 1:2] * (pc_range[4] - pc_range[1]) + pc_range[1]
+        reference_points[..., 2:3] = reference_points[..., 2:3] * (pc_range[5] - pc_range[2]) + pc_range[2]
 
-        reference_points = torch.cat(
-            (reference_points, torch.ones_like(reference_points[..., :1])), -1)
+        reference_points = torch.cat((reference_points, torch.ones_like(reference_points[..., :1])), -1)
 
         reference_points = reference_points.permute(1, 0, 2, 3)
         D, B, num_query = reference_points.size()[:3]
         num_cam = lidar2img.size(1)
 
-        reference_points = reference_points.view(
-            D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
+        reference_points = reference_points.view(D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
 
-        lidar2img = lidar2img.view(
-            1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
+        lidar2img = lidar2img.view(1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
 
-        reference_points_cam = torch.matmul(lidar2img.to(torch.float32),
-                                            reference_points.to(torch.float32)).squeeze(-1)
+        """
+        [PAPER REVIEW] key function) BEV space의 3d ref points (총 4만개)를 각 2d camera image에 projection
+        
+        중요! reference_points와 lidar2img를 matmul함으로써 3D 상의 ref points를 각 카메라 image plane에 projection 시킴
+        """
+        # num_cams, _, num_bev_queries, num_points_in_pillar (즉 z anchor 개수), pixel 위치 (norm)
+        reference_points_cam = torch.matmul(lidar2img.to(torch.float32), reference_points.to(torch.float32)).squeeze(-1)
         eps = 1e-5
 
         bev_mask = (reference_points_cam[..., 2:3] > eps)
@@ -130,6 +141,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
         reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
         reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
 
+        # 투영된 pixel 좌표가 [0, 1] 사이에 존재해야지만 해당 이미지에서 보이는 points로 간주
         bev_mask = (bev_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)
                     & (reference_points_cam[..., 0:1] < 1.0)
@@ -182,15 +194,34 @@ class BEVFormerEncoder(TransformerLayerSequence):
         output = bev_query
         intermediate = []
 
+        """
+        [PAPER REVIEW] 7. "We first lift each query on the BEV plane to a pillar-like query" 3차원 BEV plane에 reference points 지정하는 단계
+        pc_range == point_cloud_range (bevformer_base.py에 정의됨)는 하나의 BEV plane이 나타내는 실제 환경의 range를 의미함
+        point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        
+        ref_3d: reference points in 3D space, used in spatial cross-attention (SCA)
+        ref_2d: reference points on 2D bev plane, used in temporal self-attention (TSA).
+        어쨋든 현재는 모두 빈 껍데기의 텐서
+        """
         ref_3d = self.get_reference_points(
-            bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
+            bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, 
+            dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
 
-        reference_points_cam, bev_mask = self.point_sampling(
-            ref_3d, self.pc_range, kwargs['img_metas'])
+        """
+        [PAPER REVIEW] 9. "Then, sample N_ref 3D reference points from the pillar, and then project these points to 2D views"
+        
+        reference_points_cam: BEV space의 pre-defined 3D reference point (총 4만개)를 각 2d camera image에 projection한 결과
+        bev_mask: 3D ref point가 특정 카메라 이미지에 존재하는지에 대한 mask (T or F)
+        """
+        reference_points_cam, bev_mask = self.point_sampling(ref_3d, self.pc_range, kwargs['img_metas'])
 
-        # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
+        """
+        [PAPER REVIEW] infer-frame ego-motion을 통해 얻은 bev 간 shift 정보를 토대로 2d reference 포인트를 이동
+        
+        shift는 inter-frame ego-motion (현재 frame이 이전 frame 대비 얼마나 이동했는지)을 2d bev space 상의 delta 값으로 가짐
+        """
         shift_ref_2d = ref_2d  # .clone()
         shift_ref_2d += shift[:, None, None, :]
 
@@ -200,15 +231,18 @@ class BEVFormerEncoder(TransformerLayerSequence):
         bs, len_bev, num_bev_level, _ = ref_2d.shape
         if prev_bev is not None:
             prev_bev = prev_bev.permute(1, 0, 2)
-            prev_bev = torch.stack(
-                [prev_bev, bev_query], 1).reshape(bs*2, len_bev, -1)
-            hybird_ref_2d = torch.stack([shift_ref_2d, ref_2d], 1).reshape(
-                bs*2, len_bev, num_bev_level, 2)
+            prev_bev = torch.stack([prev_bev, bev_query], 1).reshape(bs*2, len_bev, -1)
+            hybird_ref_2d = torch.stack([shift_ref_2d, ref_2d], 1).reshape(bs*2, len_bev, num_bev_level, 2)
         else:
-            hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
-                bs*2, len_bev, num_bev_level, 2)
+            hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(bs*2, len_bev, num_bev_level, 2)
 
         for lid, layer in enumerate(self.layers):
+            """
+            [PAPER REVIEW] 11. 6층의 encoder layer 통과
+            각 encoder layer의 operation_order=('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')
+            
+            다음: 밑 부분 BEVFormerLayer
+            """
             output = layer(
                 bev_query,
                 key,
@@ -354,6 +388,16 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
             # temporal self attention
             if layer == 'self_attn':
 
+                """
+                [PAPER REVIEW] 12. Temporal self-attention 먼저 통과
+                input으로 사용되는 ref_2d는 위에서 구한 hybird_ref_2d로, shift_ref_2d와 ref_2d가 같이 tensor를 구성함
+                BEVFormer에서 self-attention을 사용하는 목적은 inter-frame 간의 temporal information을 modeling 하기 위함
+                
+                shift_ref_2d는 prev bev를 현재 bev에 대응하는 위치로 이동시킨 뒤 (즉, align) 같은 위치에 존재하는 cell끼리 self-attention하여
+                그 관계를 파악하기 위함임
+                
+                prev_bev가 key/value 구성 (parameter 2: key, parameter 3: value) => self-attention!
+                """
                 query = self.attentions[attn_index](
                     query,
                     prev_bev,
@@ -377,6 +421,9 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
 
             # spaital cross attention
             elif layer == 'cross_attn':
+                """ @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                [PAPER REVIEW] 15. Spatial cross-attention 다음으로 통과
+                """
                 query = self.attentions[attn_index](
                     query,
                     key,

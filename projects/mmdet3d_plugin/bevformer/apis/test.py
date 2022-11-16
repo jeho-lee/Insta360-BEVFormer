@@ -17,7 +17,6 @@ from mmcv.runner import get_dist_info
 
 from mmdet.core import encode_mask_results
 
-
 import mmcv
 import numpy as np
 import pycocotools.mask as mask_util

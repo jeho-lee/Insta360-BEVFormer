@@ -119,27 +119,34 @@ class PerceptionTransformer(BaseModule):
         bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
 
+        """
+        [PAPER REVIEW] 4. inter-frame의 delta rotation and translation를 통해 bev가 얼만큼 이동했는지 계산
+        
+        !!dataset의 img_metas 부분의 can_bus가 활용되며, delta 정보는 이미 계산되어 can_bus에 저장되어 있음
+        
+        Q) 각 camera i 에 해당하는 calib matrix는 어디에서 불러오는거지? 
+        """
         # obtain rotation angle and shift with ego motion
-        delta_x = np.array([each['can_bus'][0]
-                           for each in kwargs['img_metas']])
-        delta_y = np.array([each['can_bus'][1]
-                           for each in kwargs['img_metas']])
-        ego_angle = np.array(
-            [each['can_bus'][-2] / np.pi * 180 for each in kwargs['img_metas']])
+        delta_x = np.array([each['can_bus'][0] for each in kwargs['img_metas']])
+        delta_y = np.array([each['can_bus'][1] for each in kwargs['img_metas']])
+        ego_angle = np.array([each['can_bus'][-2] / np.pi * 180 for each in kwargs['img_metas']])
+        
         grid_length_y = grid_length[0]
         grid_length_x = grid_length[1]
         translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2)
         translation_angle = np.arctan2(delta_y, delta_x) / np.pi * 180
         bev_angle = ego_angle - translation_angle
-        shift_y = translation_length * \
-            np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h
-        shift_x = translation_length * \
-            np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w
+        shift_y = translation_length * np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h
+        shift_x = translation_length * np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w
         shift_y = shift_y * self.use_shift
         shift_x = shift_x * self.use_shift
-        shift = bev_queries.new_tensor(
-            [shift_x, shift_y]).permute(1, 0)  # xy, bs -> bs, xy
+        shift = bev_queries.new_tensor([shift_x, shift_y]).permute(1, 0)  # xy, bs -> bs, xy
 
+        """
+        [PAPER REVIEW] 5. "We first align B_t-1 to Q (current bev queries) according to ego-motion
+        to make the features at the same grid corrspond to the same real-world location"
+        즉 직전 bev와 현재 bev를 inter-frame motion에 맞게 align 시킴
+        """
         if prev_bev is not None:
             if prev_bev.shape[1] == bev_h * bev_w:
                 prev_bev = prev_bev.permute(1, 0, 2)
@@ -147,17 +154,13 @@ class PerceptionTransformer(BaseModule):
                 for i in range(bs):
                     # num_prev_bev = prev_bev.size(1)
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
-                    tmp_prev_bev = prev_bev[:, i].reshape(
-                        bev_h, bev_w, -1).permute(2, 0, 1)
-                    tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,
-                                          center=self.rotate_center)
-                    tmp_prev_bev = tmp_prev_bev.permute(1, 2, 0).reshape(
-                        bev_h * bev_w, 1, -1)
+                    tmp_prev_bev = prev_bev[:, i].reshape(bev_h, bev_w, -1).permute(2, 0, 1)
+                    tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle, center=self.rotate_center)
+                    tmp_prev_bev = tmp_prev_bev.permute(1, 2, 0).reshape(bev_h * bev_w, 1, -1)
                     prev_bev[:, i] = tmp_prev_bev[:, 0]
 
         # add can bus signals
-        can_bus = bev_queries.new_tensor(
-            [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
+        can_bus = bev_queries.new_tensor([each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
         can_bus = self.can_bus_mlp(can_bus)[None, :, :]
         bev_queries = bev_queries + can_bus * self.use_can_bus
 
@@ -169,8 +172,7 @@ class PerceptionTransformer(BaseModule):
             feat = feat.flatten(3).permute(1, 0, 3, 2)
             if self.use_cams_embeds:
                 feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
-            feat = feat + self.level_embeds[None,
-                                            None, lvl:lvl + 1, :].to(feat.dtype)
+            feat = feat + self.level_embeds[None, None, lvl:lvl + 1, :].to(feat.dtype)
             spatial_shapes.append(spatial_shape)
             feat_flatten.append(feat)
 
@@ -180,9 +182,12 @@ class PerceptionTransformer(BaseModule):
         level_start_index = torch.cat((spatial_shapes.new_zeros(
             (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-        feat_flatten = feat_flatten.permute(
-            0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
+        feat_flatten = feat_flatten.permute(0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
 
+        """
+        [PAPER REVIEW] 6. Feed flatten image features to 6 encoder layers 
+        다음: encoder.py의 forward 함수
+        """
         bev_embed = self.encoder(
             bev_queries,
             feat_flatten,
@@ -248,7 +253,11 @@ class PerceptionTransformer(BaseModule):
                     be returned when `as_two_stage` is True, \
                     otherwise None.
         """
-
+        
+        """
+        [PAPER REVIEW] 3. Transformer 시작 => Encoder 통과, 먼저 multi-view img features로부터 bev features 획득
+        다음 => get_bev_features 함수
+        """
         bev_embed = self.get_bev_features(
             mlvl_feats,
             bev_queries,
@@ -272,6 +281,10 @@ class PerceptionTransformer(BaseModule):
         query_pos = query_pos.permute(1, 0, 2)
         bev_embed = bev_embed.permute(1, 0, 2)
 
+        """ @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        [PAPER REVIEW] 16. Decoder 통과
+        value <= encoder 통과하여 얻은 bev embedding features (spatial and temporal features)
+        """
         inter_states, inter_references = self.decoder(
             query=query,
             key=None,

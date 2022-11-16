@@ -167,6 +167,11 @@ class BEVFormerHead(DETRHead):
                 prev_bev=prev_bev,
             )
         else:
+            """
+            [PAPER REVIEW] 2. Transformer part start (Encoder-decoder pipeline)
+            Input: multi-view image features, bev queries, bev positional embedding, previous bev, image meta datas
+            다음 => bevformer/modules/transformer.py의 forward 함수
+            """
             outputs = self.transformer(
                 mlvl_feats,
                 bev_queries,
@@ -503,6 +508,11 @@ class BEVFormerHead(DETRHead):
             list[dict]: Decoded bbox, scores and labels after nms.
         """
 
+        """ @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        [PAPER REVIEW] 18. 3D bounding box generation
+        
+        bbox_coder.decode() ==> mmdet3d_plugin/core/bbox/coders/nms_free_coder.py
+        """
         preds_dicts = self.bbox_coder.decode(preds_dicts)
 
         num_samples = len(preds_dicts)

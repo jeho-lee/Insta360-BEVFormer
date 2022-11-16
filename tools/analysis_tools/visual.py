@@ -27,8 +27,6 @@ from nuscenes.eval.detection.utils import category_to_detection_name
 from nuscenes.eval.detection.render import visualize_sample
 
 
-
-
 cams = ['CAM_FRONT',
  'CAM_FRONT_RIGHT',
  'CAM_BACK_RIGHT',

@@ -7,7 +7,7 @@ import mmcv
 from os import path as osp
 from mmdet.datasets import DATASETS
 import torch
-import numpy as np
+import numpy as np 
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
 from .nuscnes_eval import NuScenesEval_custom
 from projects.mmdet3d_plugin.models.utils.visual import save_tensor
@@ -36,6 +36,9 @@ class CustomNuScenesDataset(NuScenesDataset):
         Returns:
             dict: Training data dict of the corresponding index.
         """
+        
+        print("@@@@@@@@@@prepare_train_data@@@@@@@@@@")
+        
         queue = []
         index_list = list(range(index-self.queue_length, index))
         random.shuffle(index_list)
@@ -53,7 +56,6 @@ class CustomNuScenesDataset(NuScenesDataset):
                 return None
             queue.append(example)
         return self.union2one(queue)
-
 
     def union2one(self, queue):
         imgs_list = [each['img'].data for each in queue]
@@ -98,8 +100,7 @@ class CustomNuScenesDataset(NuScenesDataset):
                 - sweeps (list[dict]): Infos of sweeps.
                 - timestamp (float): Sample timestamp.
                 - img_filename (str, optional): Image filename.
-                - lidar2img (list[np.ndarray], optional): Transformations \
-                    from lidar to different cameras.
+                - lidar2img (list[np.ndarray], optional): Transformations from lidar to different cameras.
                 - ann_info (dict): Annotation info.
         """
         info = self.data_infos[index]
@@ -127,8 +128,7 @@ class CustomNuScenesDataset(NuScenesDataset):
                 image_paths.append(cam_info['data_path'])
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
-                lidar2cam_t = cam_info[
-                    'sensor2lidar_translation'] @ lidar2cam_r.T
+                lidar2cam_t = cam_info['sensor2lidar_translation'] @ lidar2cam_r.T
                 lidar2cam_rt = np.eye(4)
                 lidar2cam_rt[:3, :3] = lidar2cam_r.T
                 lidar2cam_rt[3, :3] = -lidar2cam_t
@@ -153,16 +153,20 @@ class CustomNuScenesDataset(NuScenesDataset):
             annos = self.get_ann_info(index)
             input_dict['ann_info'] = annos
 
+        # actually, the nuScenes provides the rotation and translation of each sample, which is more accurate than we obtained from can bus.
         rotation = Quaternion(input_dict['ego2global_rotation'])
         translation = input_dict['ego2global_translation']
         can_bus = input_dict['can_bus']
-        can_bus[:3] = translation
+        
+        # We use the provided translation and rotation to repalce the original translation and rotation in can bus
+        can_bus[:3] = translation 
         can_bus[3:7] = rotation
-        patch_angle = quaternion_yaw(rotation) / np.pi * 180
+        
+        patch_angle = quaternion_yaw(rotation) / np.pi * 180 # we get the yaw angle of ego car
         if patch_angle < 0:
             patch_angle += 360
-        can_bus[-2] = patch_angle / 180 * np.pi
-        can_bus[-1] = patch_angle
+        can_bus[-2] = patch_angle / 180 * np.pi # this angle is kept unchanged.
+        can_bus[-1] = patch_angle # this angle is used to compute the detal of adjacent timestamps.
 
         return input_dict
 
@@ -171,6 +175,7 @@ class CustomNuScenesDataset(NuScenesDataset):
         Returns:
             dict: Data dictionary of the corresponding index.
         """
+        print("@@@@@@@@@@__getitem__@@@@@@@@@@")
         if self.test_mode:
             return self.prepare_test_data(idx)
         while True:

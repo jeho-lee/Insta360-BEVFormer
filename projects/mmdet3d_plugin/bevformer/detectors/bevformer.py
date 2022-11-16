@@ -240,7 +240,7 @@ class BEVFormer(MVXTwoStageDetector):
                 raise TypeError('{} must be a list, but got {}'.format(
                     name, type(var)))
         img = [img] if img is None else img
-
+        
         if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
             # the first sample of each scene is truncated
             self.prev_frame_info['prev_bev'] = None
@@ -251,6 +251,9 @@ class BEVFormer(MVXTwoStageDetector):
         if not self.video_test_mode:
             self.prev_frame_info['prev_bev'] = None
 
+        """
+        [PAPER REVIEW] 0. can_bus를 이전 frame과의 delta translation 및 rotation로 재저장
+        """
         # Get the delta of ego position and angle between two timestamps.
         tmp_pos = copy.deepcopy(img_metas[0][0]['can_bus'][:3])
         tmp_angle = copy.deepcopy(img_metas[0][0]['can_bus'][-1])
@@ -260,9 +263,13 @@ class BEVFormer(MVXTwoStageDetector):
         else:
             img_metas[0][0]['can_bus'][-1] = 0
             img_metas[0][0]['can_bus'][:3] = 0
-
+        
         new_prev_bev, bbox_results = self.simple_test(
             img_metas[0], img[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
+        
+        """ 
+        [PAPER REVIEW] 마지막. simple_test 결과 (즉, encoder-decoder 및 3D box prediction 결과)를 토대로 previous bev 업데이트
+        """
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
@@ -271,8 +278,19 @@ class BEVFormer(MVXTwoStageDetector):
 
     def simple_test_pts(self, x, img_metas, prev_bev=None, rescale=False):
         """Test function"""
+        
+        """
+        [PAPER REVIEW] 1. inference pipeline이 시작하는 첫번째 line, 
+        !!!!!!!!!!pts_bbox_head == bevformer_head 
+        
+        x는 multi-view images로부터 추출한 features, 
+        다음 => bevformer/dense_head/bevformer_head의 forward 함수
+        """
         outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev)
 
+        """
+        [PAPER REVIEW] 17. 얻은 최종 outputs로 3d box 생성 (예측은 이미 수행된 것?)
+        """
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [

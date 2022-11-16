@@ -119,7 +119,6 @@ if platform.system() != 'Windows':
 
 OBJECTSAMPLERS = Registry('Object sampler')
 
-
 def custom_build_dataset(cfg, default_args=None):
     from mmdet3d.datasets.dataset_wrappers import CBGSDataset
     from mmdet.datasets.dataset_wrappers import (ClassBalancedDataset,
