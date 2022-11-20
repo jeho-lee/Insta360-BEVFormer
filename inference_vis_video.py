@@ -10,6 +10,8 @@ import numpy as np
 from torchvision import transforms
 from PIL import Image
 import glob
+import pyquaternion
+from nuscenes.utils.data_classes import Box as NuScenesBox
 
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
@@ -45,6 +47,20 @@ from nuscenes.utils.data_classes import LidarPointCloud, RadarPointCloud, Box
 from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
+
+from collections import OrderedDict
+from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.geometry_utils import view_points
+from os import path as osp
+from pyquaternion import Quaternion
+from nuscenes.eval.common.utils import quaternion_yaw
+from shapely.geometry import MultiPoint, box
+from typing import List, Tuple, Union
+
+from mmdet3d.core.bbox.box_np_ops import points_cam2img
+from mmdet3d.datasets import NuScenesDataset
+from nuscenes.nuscenes import NuScenes
+from nuscenes.can_bus.can_bus_api import NuScenesCanBus
 
 def render_annotation(
         anntoken: str,
@@ -457,6 +473,60 @@ def get_predicted_data(sample_data_token: str,
 
     return data_path, box_list, cam_intrinsic
 
+def get_quaternion_from_euler(e):
+    """
+    Convert an Euler angle to a quaternion.
+
+    Input
+    :param roll: The roll (rotation around x-axis) angle in radians.
+    :param pitch: The pitch (rotation around y-axis) angle in radians.
+    :param yaw: The yaw (rotation around z-axis) angle in radians.
+
+    Output
+    :return qx, qy, qz, qw: The orientation in quaternion [x,y,z,w] format
+    """
+    roll = e[0]
+    pitch = e[1]
+    yaw = e[2]
+
+    qx = np.sin(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) - np.cos(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
+    qy = np.cos(roll/2) * np.sin(pitch/2) * np.cos(yaw/2) + np.sin(roll/2) * np.cos(pitch/2) * np.sin(yaw/2)
+    qz = np.cos(roll/2) * np.cos(pitch/2) * np.sin(yaw/2) - np.sin(roll/2) * np.sin(pitch/2) * np.cos(yaw/2)
+    qw = np.cos(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) + np.sin(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
+
+    return [qw, qx, qy, qz]
+
+def euler_from_quaternion(q):
+    """
+    Convert a quaternion into euler angles (roll, pitch, yaw)
+    roll is rotation around x in radians (counterclockwise)
+    pitch is rotation around y in radians (counterclockwise)
+    yaw is rotation around z in radians (counterclockwise)
+    """
+    import math
+    w = q[0]
+    x = q[1]
+    y = q[2]
+    z = q[3]
+    
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    # roll_x = math.atan2(t0, t1) / np.pi * 180 # degrees
+    roll_x = math.atan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else t2
+    t2 = -1.0 if t2 < -1.0 else t2
+    # pitch_y = math.asin(t2) / np.pi * 180
+    pitch_y = math.asin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z) 
+    # yaw_z = math.atan2(t3, t4) / np.pi * 180
+    yaw_z = math.atan2(t3, t4)
+
+    return [roll_x, pitch_y, yaw_z] # in radian
+
 rank, world_size = get_dist_info()
 
 os.environ['MASTER_ADDR'] = 'localhost'
@@ -616,6 +686,222 @@ tangent_intrinsics = {'CAM_FRONT': [[1343.45019, 0.0, 820.183159], [0.0, 1280.23
 #              './data/insta360_sample_video/raw_data/tangent_images/4_front_right/'+cur_frame, './data/insta360_sample_video/raw_data/tangent_images/1_back_left/'+cur_frame,
 #             './data/insta360_sample_video/raw_data/tangent_images/0_back/'+cur_frame, './data/insta360_sample_video/raw_data/tangent_images/5_back_right/'+cur_frame]
 
+
+"""lidar2img 변경"""
+train_nusc_infos = []
+val_nusc_infos = []
+frame_idx = 0
+
+sample = nusc.sample[0]
+
+lidar_token = sample['data']['LIDAR_TOP']
+sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+cs_record = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
+
+mmcv.check_file_exist(lidar_path)
+
+info = {
+    'lidar_path': lidar_path,
+    'token': sample['token'],
+    'prev': sample['prev'],
+    'next': sample['next'],
+    'frame_idx': frame_idx,  # temporal related info
+    'sweeps': [],
+    'cams': dict(),
+    'scene_token': sample['scene_token'],  # temporal related info
+    'lidar2ego_translation': cs_record['translation'],
+    'lidar2ego_rotation': cs_record['rotation'],
+    'ego2global_translation': pose_record['translation'],
+    'ego2global_rotation': pose_record['rotation'],
+    'timestamp': sample['timestamp'],
+}
+
+if sample['next'] == '':
+        frame_idx = 0
+else:
+    frame_idx += 1
+
+l2e_r = info['lidar2ego_rotation']
+l2e_t = info['lidar2ego_translation']
+e2g_r = info['ego2global_rotation']
+e2g_t = info['ego2global_translation']
+l2e_r_mat = Quaternion(l2e_r).rotation_matrix # 3x3
+e2g_r_mat = Quaternion(e2g_r).rotation_matrix
+
+# obtain 6 image's information per frame
+camera_types = [
+    'CAM_FRONT',
+    'CAM_FRONT_RIGHT',
+    'CAM_FRONT_LEFT',
+    'CAM_BACK',
+    'CAM_BACK_LEFT',
+    'CAM_BACK_RIGHT',
+]
+
+temp_sensor2lidar_rotations = []
+temp_sensor2ego_rotations = []
+temp_sensor2ego_translations = []
+
+for cam in camera_types:
+    cam_token = sample['data'][cam]
+    cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
+
+    # cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat, e2g_t, e2g_r_mat, cam)
+    sd_rec = nusc.get('sample_data', cam_token)
+    cs_record = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+    pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+    data_path = str(nusc.get_sample_data_path(sd_rec['token']))
+    if os.getcwd() in data_path:  # path from lyftdataset is absolute path
+        data_path = data_path.split(f'{os.getcwd()}/')[-1]  # relative path
+    cam_info = {
+        'data_path': data_path,
+        'type': cam_token,
+        'sample_data_token': sd_rec['token'],
+        'sensor2ego_translation': cs_record['translation'],
+        'sensor2ego_rotation': cs_record['rotation'],
+        'ego2global_translation': pose_record['translation'],
+        'ego2global_rotation': pose_record['rotation'],
+        'timestamp': sd_rec['timestamp']
+    }
+
+    l2e_r_s = cam_info['sensor2ego_rotation']
+    l2e_t_s = cam_info['sensor2ego_translation']
+    
+    """ego2global (pose) 변경"""
+    e2g_r_s = cam_info['ego2global_rotation']
+    e2g_t_s = cam_info['ego2global_translation']
+    # print(e2g_r_s)
+    # print(e2g_t_s)
+    # radians = euler_from_quaternion(Quaternion(e2g_r_s).inverse)
+    # print([euler / np.pi * 180 for euler in radians])
+
+    # obtain the RT from sensor to Top LiDAR
+    # cam->ego->global->ego'->lidar
+    l2e_r_s_mat = Quaternion(l2e_r_s).rotation_matrix
+    e2g_r_s_mat = Quaternion(e2g_r_s).rotation_matrix
+    
+    temp_sensor2ego_translations.append(l2e_t_s)
+    temp_sensor2ego_rotations.append(l2e_r_s_mat)
+    
+    R = (l2e_r_s_mat.T @ e2g_r_s_mat.T) @ (
+        np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
+    T = (l2e_t_s @ e2g_r_s_mat.T + e2g_t_s) @ (
+        np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
+    T -= e2g_t @ (np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T
+                  ) + l2e_t @ np.linalg.inv(l2e_r_mat).T
+    cam_info['sensor2lidar_rotation'] = R.T  # points @ R.T + T
+    cam_info['sensor2lidar_translation'] = T
+
+    temp_sensor2lidar_rotations.append(cam_info['sensor2lidar_rotation'])
+    
+    cam_info.update(cam_intrinsic=cam_intrinsic)
+    info['cams'].update({cam: cam_info})
+    
+"""Sensor2lidar rotation degrees 확인"""
+for mat in temp_sensor2lidar_rotations:
+    rot_q = Quaternion(matrix=mat)
+    eulers = euler_from_quaternion(Quaternion(rot_q))
+    # print("matrix", mat)
+    # print("quaternion", rot_q)
+    # print("euler in radian", eulers)
+    # print("euler in degree", [euler / np.pi * 180 for euler in eulers])
+    # print()
+
+"""sensor2lidar rotation degree를 insta360에 맞게 변경"""
+sensor2lidar_euler_degrees = [[-88.89452145820958, -0.34991764317283675, 0.0], # FRONT
+                              [-89.73833720738743, 1.5337073678165962, -60.0], # FRONT_RIGHT
+                              [-89.2717432442176, -1.221029004801636, 60.0], # FRONT_LEFT
+                              [-90.4448247670561, 0.552239989680819, 180.0], # BACK
+                              [-91.67728722938543, -1.4284019448799024, 120.0], # BACK_LFET
+                              [-91.13862482181912, 2.0544464501438036, -120.0]] # BACK_RIGHT
+
+# degree를 r matrix로 변경해야함
+sensor2lidar_rotations = [] # tcam2egocam_rotations
+for sensor2lidar_degrees in sensor2lidar_euler_degrees: # sensor2lidar == tangent cam 2 ego cam in Insta360
+    sensor2lidar_radians = [degree * np.pi / 180 for degree in sensor2lidar_degrees]
+    sensor2lidar_q = Quaternion(get_quaternion_from_euler(sensor2lidar_radians))
+    sensor2lidar_r_mat = sensor2lidar_q.rotation_matrix
+    sensor2lidar_rotations.append(sensor2lidar_r_mat)
+    
+    # 확인
+    # radians = euler_from_quaternion(sensor2lidar_q)
+    # print([euler / np.pi * 180 for euler in radians])
+
+i = 0
+lidar2img_rts = []
+for cam_type, cam_info in info['cams'].items():
+    # obtain lidar to image transformation matrix
+    
+    """rotation insta360에 맞게 변경"""
+    # lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
+    lidar2cam_r = np.linalg.inv(sensor2lidar_rotations[i])
+    
+    """translation insta360에 맞게 변경"""
+    lidar2cam_t = cam_info['sensor2lidar_translation'] @ lidar2cam_r.T
+    # lidar2cam_t = [0.0, 0.0, 1.59] @ lidar2cam_r.T
+    
+    lidar2cam_rt = np.eye(4)
+    lidar2cam_rt[:3, :3] = lidar2cam_r.T
+    lidar2cam_rt[3, :3] = -lidar2cam_t
+    
+    """cam intrinsic insta360에 맞게 변경"""
+    # intrinsic = cam_info['cam_intrinsic']
+    intrinsic = np.array(tangent_intrinsics[cam_type])
+    
+    viewpad = np.eye(4)
+    viewpad[:intrinsic.shape[0], :intrinsic.shape[1]] = intrinsic
+    lidar2img_rt = (viewpad @ lidar2cam_rt.T)
+    lidar2img_rts.append(lidar2img_rt)
+    i = i + 1
+    
+"""2. sensor2ego rotations 변경"""
+
+"""Sensor2ego rotation degrees 확인"""
+for mat in temp_sensor2ego_rotations:
+    rot_q = Quaternion(matrix=mat)
+    eulers = euler_from_quaternion(Quaternion(rot_q))
+    # print("matrix", mat)
+    # print("quaternion", rot_q)
+    # print("euler in radian", eulers)
+    # print([euler / np.pi * 180 for euler in eulers])
+    # print()
+    
+camera_types = [
+    'CAM_FRONT',
+    'CAM_FRONT_RIGHT',
+    'CAM_FRONT_LEFT',
+    'CAM_BACK',
+    'CAM_BACK_LEFT',
+    'CAM_BACK_RIGHT',
+]
+
+"""sensor2ego rotation degree를 insta360에 맞게 변경"""
+sensor2ego_rotation_degrees = [[-90.32322642770005, -0.046127194838589326, -90.0], # FRONT 기준으로
+                               [-90.7820235885, 0.5188438566959973, -150.0], # FRONT RIGHT
+                               [-89.85977500319999, 0.12143609391200436, -30.0], # FRONT LEFT
+                               [-89.0405962694, 0.22919685786400154, 90.0], # BACK
+                               [-90.91736319750001, -0.21518275753700122, 30.0], # BACK_LFET
+                               [-90.93206677999999, 0.6190947610589966, -210.0]] # BACK_RIGHT
+i = 0
+sensor2ego_rotations = {} # tcam2egocam_rotations
+for sensor2ego_degrees in sensor2ego_rotation_degrees: # sensor2ego == tangent cam 2 ego cam in Insta360
+    sensor2ego_radians = [degree * np.pi / 180 for degree in sensor2ego_degrees]
+    sensor2ego_q = Quaternion(get_quaternion_from_euler(sensor2ego_radians))
+    sensor2ego_r_mat = sensor2ego_q.rotation_matrix
+    
+    sensor2ego_rotations[camera_types[i]] = sensor2ego_r_mat
+    i = i + 1
+
+
+    
+    
+    
+    
+    
+    
+
 images = glob.glob('./data/simple_road_outdoor_oct_23/erp/*.jpg')
 images = sorted(images)
 
@@ -656,7 +942,6 @@ for image in images:
     cdata['img_metas'] = cdata['img_metas'][0].data
     cdata['img'] = cdata['img'][0].data
 
-
     # Data loader에서 얻은 하나의 data를 custom data로 변경
 
     # img_metas 변경
@@ -676,9 +961,38 @@ for image in images:
     
     # lidar2img 변경 (array 순서: front, front_right, front_left, back, back_left, back_right)
     # data['img_metas'][0][0]['lidar2img'] = ego2patches
+    data['img_metas'][0][0]['lidar2img'] = lidar2img_rts
 
     """@@@@@@@@ TODO @@@@@@@@"""
     # TODO: pose 및 frame sequence (prev, next) 관련
+    
+    
+    
+    
+    
+    
+    
+    """Can_bus 변경 임시"""
+    rotation = Quaternion([0.999514282, -0.009492505, -0.029651314, 0.001394546])
+
+    """nuscenes: x가 차 전진 방향, y는 차량 좌우 방향, z는 차 위아래 방향"""
+    # translation = [-0.008222580, -0.006377218, 0.040763527] # 원래
+    translation = [0.040763527, -0.008222580, -0.006377218]
+
+    data['img_metas'][0][0]['can_bus'][:3] = translation
+    data['img_metas'][0][0]['can_bus'][3:7] = rotation
+
+    patch_angle = quaternion_yaw(rotation) / np.pi * 180 # we get the yaw angle of ego car
+    if patch_angle < 0:
+        patch_angle += 360
+    data['img_metas'][0][0]['can_bus'][-2] = patch_angle / 180 * np.pi # this angle is kept unchanged.
+    data['img_metas'][0][0]['can_bus'][-1] = patch_angle # this angle is used to compute the detal of adjacent timestamps.
+    
+    
+    
+    
+    
+    
 
     bbox_results = []
     mask_results = []
@@ -749,31 +1063,198 @@ for image in images:
     # return
     outputs = {'bbox_results': new_bbox_results, 'mask_results': None}
 
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     # Write Results into File
     mmcv.dump(outputs['bbox_results'], './output.pkl')
-
     jsonfile_prefix = osp.join('simple_road_scene_results', config.split('/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
-
     result_files = dict()
-    for name in outputs['bbox_results'][0]:
-        results_ = [out[name] for out in outputs['bbox_results']]
-        tmp_file_ = osp.join(jsonfile_prefix, name)
-        result_files.update({name: dataset._format_bbox(results_, tmp_file_)})
 
+    # results_ = [out['pts_bbox'] for out in outputs['bbox_results']]
+    # tmp_file_ = osp.join(jsonfile_prefix, name)
+    # for name in outputs['bbox_results'][0]:
+    #     results_ = [out[name] for out in outputs['bbox_results']]
+    #     tmp_file_ = osp.join(jsonfile_prefix, name)
+    #     result_files.update({name: dataset._format_bbox(results_, tmp_file_)})
+
+    # 변경
+    """CUSTOM FORMAT BBOX START"""
+
+    results = [out['pts_bbox'] for out in outputs['bbox_results']]
+    jsonfile_prefix_tmp = osp.join(jsonfile_prefix, 'pts_bbox')
+
+    nusc_annos = {}
+    mapped_class_names = dataset.CLASSES
+
+    print('Start to convert detection format...')
+    for sample_id, detection in enumerate(mmcv.track_iter_progress(results)):
+        annos = []
+
+        """START FUNC output_to_nusc_box(det, with_velocity)"""
+        # boxes = output_to_nusc_box(det, True)
+        box3d = detection['boxes_3d']
+        scores = detection['scores_3d'].numpy()
+        labels = detection['labels_3d'].numpy()
+
+        box_gravity_center = box3d.gravity_center.numpy()
+        box_dims = box3d.dims.numpy()
+        box_yaw = box3d.yaw.numpy()
+
+        # our LiDAR coordinate system -> nuScenes box coordinate system
+        nus_box_dims = box_dims[:, [1, 0, 2]]
+
+        boxes_lidar = []
+        for i in range(len(box3d)):
+            quat = Quaternion(axis=[0, 0, 1], radians=box_yaw[i])
+            if dataset.with_velocity:
+                velocity = (*box3d.tensor[i, 7:9], 0.0)
+            else:
+                velocity = (0, 0, 0)
+            # velo_val = np.linalg.norm(box3d[i, 7:9])
+            # velo_ori = box3d[i, 6]
+            # velocity = (
+            # velo_val * np.cos(velo_ori), velo_val * np.sin(velo_ori), 0.0)
+            box = NuScenesBox(
+                box_gravity_center[i],
+                nus_box_dims[i],
+                quat,
+                label=labels[i],
+                score=scores[i],
+                velocity=velocity)
+            boxes_lidar.append(box)
+        """END FUNC output_to_nusc_box(det, with_velocity)"""
+
+        sample_token = dataset.data_infos[sample_id]['token']
+
+        """START FUNC lidar_nusc_box_to_global(): Convert the box from ego to global coordinate """
+        # boxes = lidar_nusc_box_to_global(dataset.data_infos[sample_id], boxes, mapped_class_names, dataset.eval_detection_configs, dataset.eval_version)
+        info = dataset.data_infos[sample_id]
+        classes = mapped_class_names
+        eval_configs = dataset.eval_detection_configs
+        eval_version = dataset.eval_version
+
+        boxes = []
+        for box in boxes_lidar:
+
+            # Move box to ego vehicle coord system
+            box.rotate(Quaternion(info['lidar2ego_rotation']))
+            box.translate(np.array(info['lidar2ego_translation']))
+
+            # lidar2ego_radians = [degree * np.pi / 180 for degree in [0.0, 0.0, -89.8835]]
+            # lidar2ego_q = Quaternion(get_quaternion_from_euler(lidar2ego_radians))
+            # box.rotate(lidar2ego_q)
+            # box.translate(np.array(info['lidar2ego_translation']))
+
+            # print(np.array(info['lidar2ego_translation']))
+            # radians = euler_from_quaternion(lidar2ego_q)
+            # print([euler / np.pi * 180 for euler in radians])
+
+            # filter det in ego.
+            cls_range_map = eval_configs.class_range
+            radius = np.linalg.norm(box.center[:2], 2)
+            det_range = cls_range_map[classes[box.label]]
+            if radius > det_range:
+                continue
+
+            # Move box to global coord system
+            # box.rotate(pyquaternion.Quaternion(info['ego2global_rotation']))
+            # box.translate(np.array(info['ego2global_translation']))
+
+            """Ego pose 변경"""
+            rotation = [0.999514282, -0.009492505, -0.029651314, 0.001394546]
+            translation = [0.040763527, -0.008222580, -0.006377218]
+            box.rotate(pyquaternion.Quaternion(rotation))
+            box.translate(np.array(translation))
+
+            boxes.append(box)
+
+        """END FUNC lidar_nusc_box_to_global()"""
+
+        for i, box in enumerate(boxes):
+            name = mapped_class_names[box.label]
+            if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
+                if name in [
+                        'car',
+                        'construction_vehicle',
+                        'bus',
+                        'truck',
+                        'trailer',
+                ]:
+                    attr = 'vehicle.moving'
+                elif name in ['bicycle', 'motorcycle']:
+                    attr = 'cycle.with_rider'
+                else:
+                    attr = NuScenesDataset.DefaultAttribute[name]
+            else:
+                if name in ['pedestrian']:
+                    attr = 'pedestrian.standing'
+                elif name in ['bus']:
+                    attr = 'vehicle.stopped'
+                else:
+                    attr = NuScenesDataset.DefaultAttribute[name]
+
+            nusc_anno = dict(
+                sample_token=sample_token,
+                translation=box.center.tolist(),
+                size=box.wlh.tolist(),
+                rotation=box.orientation.elements.tolist(),
+                velocity=box.velocity[:2].tolist(),
+                detection_name=name,
+                detection_score=box.score,
+                attribute_name=attr)
+            annos.append(nusc_anno)
+        nusc_annos[sample_token] = annos
+    nusc_submissions = {
+        'meta': dict(
+                use_camera=True,
+                use_lidar=False,
+                use_radar=False,
+                use_map=False,
+                use_external=True),
+        'results': nusc_annos,
+    }
+
+    mmcv.mkdir_or_exist(jsonfile_prefix_tmp)
+    res_path = osp.join(jsonfile_prefix_tmp, 'results_nusc.json')
+    print('Results writes to', res_path)
+    mmcv.dump(nusc_submissions, res_path)
+    """CUSTOM FORMAT BBOX END"""
+
+    result_files.update({name: res_path})
     bevformer_results = mmcv.load(jsonfile_prefix+'/pts_bbox/results_nusc.json')
 
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     # render_annotation('7603b030b42a4b1caa8c443ccc1a7d52')
     sample_token_list = list(bevformer_results['results'].keys())
     # for id in range(0, 1):
 
+    pred_data=bevformer_results
+
     id = 0
     sample_token=sample_token_list[id]
-    pred_data=bevformer_results
     out_path=sample_token_list[id]
-
     use_flat_vehicle_coordinates = False
-    score_threshold = 0.2
-
+    score_threshold = 0.3
     with_anns = True
     box_vis_level = BoxVisibility.ANY
     axes_limit = 40
@@ -804,6 +1285,7 @@ for image in images:
 
     j = 0
     for ind, cam in enumerate(cams):
+        print("@@@@@@@@@@@ CAM: ", cam)
         sample_data_token = sample['data'][cam]
 
         sd_record = nusc.get('sample_data', sample_data_token)
@@ -815,23 +1297,30 @@ for image in images:
 
         # print("Predicted boxes", boxes)
 
-        """get predicted data - START"""
-        # data_path, boxes_pred, camera_intrinsic = get_predicted_data(sample_data_token, box_vis_level=box_vis_level, pred_anns=boxes)
+        """
+        get predicted data - START
 
+        Returns the data path as well as all annotations related to that sample_data.
+        Note that the boxes are transformed into the current sensor's coordinate frame.
+        :return: (data_path, boxes, camera_intrinsic <np.array: 3, 3>)
+        """
         # Retrieve sensor & pose records
         sd_record = nusc.get('sample_data', sample_data_token)
         cs_record = nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])
         sensor_record = nusc.get('sensor', cs_record['sensor_token'])
         pose_record = nusc.get('ego_pose', sd_record['ego_pose_token'])
-
         data_path = nusc.get_sample_data_path(sample_data_token)
         camera_intrinsic = np.array(cs_record['camera_intrinsic'])
         imsize = (sd_record['width'], sd_record['height'])
 
         # nusc => tangent cam으로 변경
         data_path = tangent_cams[ind]
-        # camera_intrinsic = np.array(tangent_intrinsics_for_vis[ind])
+        camera_intrinsic = np.array(tangent_intrinsics_for_vis[ind])
         imsize = tangent_patch_size
+
+        # print("data path", data_path)
+        # print("cam instrinsic", camera_intrinsic)
+        # print("img size", imsize)
 
         # Make list of Box objects including coord system transforms.
         boxes_pred = []
@@ -842,27 +1331,97 @@ for image in images:
                 box.translate(-np.array(pose_record['translation']))
                 box.rotate(Quaternion(scalar=np.cos(yaw / 2), vector=[0, 0, np.sin(yaw / 2)]).inverse)
             else:
-                # Move box to ego vehicle coord system.
+                # print("Current box before translation", box)
+
+                """기존 nuscenes"""
+                """
+                # Move box to ego vehicle coord system. (pose record: ego2global)
                 box.translate(-np.array(pose_record['translation']))
                 box.rotate(Quaternion(pose_record['rotation']).inverse)
 
-                #  Move box to sensor coord system.
+                # print("global2ego", -np.array(pose_record['translation']), Quaternion(pose_record['rotation']).inverse)
+                # print("Current box after moving to ego coord system", box)
+
+                #  Move box to sensor coord system. (cs_record: sensor2ego)
                 box.translate(-np.array(cs_record['translation']))
                 box.rotate(Quaternion(cs_record['rotation']).inverse)
+
+                # print("ego2sensor", -np.array(cs_record['translation']), Quaternion(cs_record['rotation']).inverse)
+                # print("Current box after moving to camera coord system", box)
+                # print()
+                """
+
+                """insta360 방안 1"""
+                # Move box to ego vehicle coord system. (pose record: ego2global)
+                # ORB_SLAM이 ego2global인지 확인 (+/- 바꿔보기)
+
+                # box.translate(-np.array(translation))
+                # box.rotate(rotation.inverse)
+
+                #  Move box to sensor coord system. 
+                # nuscenes에서는 cs_record: sensor2ego, insta360에서는 egocam2tangentcam으로 R 만 존재
+                # box.rotate(front2cam_rotvecs[cam])
+
+                # print("insta360")
+                # print("global2ego", -np.array([-0.062425584, -0.002085830, 0.344779789]), Quaternion([0.998749077, -0.013452108, -0.043297615, 0.021088535]).inverse)
+                # print()
+
+                """insta360 방안 2-1. nuscenes에서 sensor2ego rotation 변경"""
+                """
+                # Move box to ego vehicle coord system. (pose record: ego2global)
+                box.translate(-np.array(pose_record['translation']))
+                box.rotate(Quaternion(pose_record['rotation']).inverse)
+
+                #  Move box to sensor coord system. (cs_record: sensor2ego)
+                box.translate(-np.array(cs_record['translation']))
+                # box.rotate(Quaternion(cs_record['rotation']).inverse)
+                box.rotate(Quaternion(matrix=sensor2ego_rotations[cam]).inverse)
+                """
+
+                """insta360 방안 2-2. nuscenes에서 sensor2ego rotation 및 translation 변경"""
+
+                """ego2global (pose) 변경"""
+                # 1. Move box to ego vehicle coord system. (pose record: ego2global)
+                # box.translate(-np.array(pose_record['translation']))
+                # box.rotate(Quaternion(pose_record['rotation']).inverse)
+
+                # ORB-SLAM3 (ego2global인지 global2ego인지?)
+                rotation = [0.999514282, -0.009492505, -0.029651314, 0.001394546]
+                translation = [0.040763527, -0.008222580, -0.006377218]
+
+                box.translate(-np.array(translation))
+                box.rotate(Quaternion(rotation).inverse)
+
+                # print(np.array(pose_record['translation']))
+                # print(Quaternion(pose_record['rotation']))
+                # radians = euler_from_quaternion(Quaternion(rotation).inverse)
+                # print([euler / np.pi * 180 for euler in radians])
+
+                # 2. Move box to sensor coord system. (cs_record: sensor2ego)
+                box.translate(-np.array(cs_record['translation']))
+                # box.translate(-np.array([0.0, 0.0, 0.0]))
+
+                # box.rotate(Quaternion(cs_record['rotation']).inverse)
+                box.rotate(Quaternion(matrix=sensor2ego_rotations[cam]).inverse)
+
 
             if not box_in_image(box, camera_intrinsic, imsize, vis_level=box_vis_level):
                 continue
 
             boxes_pred.append(box)
 
+        """get predicted data - END"""
+
+        print("Boxes in camera viewport", boxes_pred)
+        print()
 
         if ind == 3:
             j += 1
         ind = ind % 3
-        data = Image.open(data_path)
+        img_data = Image.open(data_path)
 
         # Show image.
-        ax[j, ind].imshow(data)
+        ax[j, ind].imshow(img_data)
 
         # Show boxes.
         if with_anns:
@@ -871,8 +1430,8 @@ for image in images:
                 box.render(ax[j, ind], view=camera_intrinsic, normalize=True, colors=(c, c, c))
 
         # Limit visible range.
-        ax[j, ind].set_xlim(0, data.size[0])
-        ax[j, ind].set_ylim(data.size[1], 0)
+        ax[j, ind].set_xlim(0, img_data.size[0])
+        ax[j, ind].set_ylim(img_data.size[1], 0)
 
         ax[j, ind].axis('off')
         ax[j, ind].set_title('PRED: {} {labels_type}'.format(
@@ -881,8 +1440,18 @@ for image in images:
 
 
     plt.savefig('./pred_results/' + cur_frame, bbox_inches='tight', pad_inches=0, dpi=200)
-    # plt.show()
+    plt.show()
     plt.close()
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
 # Save to video
 os.system("ffmpeg -i pred_results/frame_%04d.jpg -vcodec libx264 -vf 'pad=ceil(iw/2)*2:ceil(ih/2)*2' -r 24 -y -an video.mp4")
