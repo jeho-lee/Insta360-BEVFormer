@@ -960,11 +960,8 @@ for image in images:
     data['img'] = [cdata['img'][None, :]]
     
     # lidar2img 변경 (array 순서: front, front_right, front_left, back, back_left, back_right)
-    # data['img_metas'][0][0]['lidar2img'] = ego2patches
-    data['img_metas'][0][0]['lidar2img'] = lidar2img_rts
+    # data['img_metas'][0][0]['lidar2img'] = lidar2img_rts
 
-    """@@@@@@@@ TODO @@@@@@@@"""
-    # TODO: pose 및 frame sequence (prev, next) 관련
     
     
     
@@ -972,21 +969,21 @@ for image in images:
     
     
     
-    """Can_bus 변경 임시"""
-    rotation = Quaternion([0.999514282, -0.009492505, -0.029651314, 0.001394546])
+#     """Can_bus 변경 임시"""
+#     rotation = Quaternion([0.999514282, -0.009492505, -0.029651314, 0.001394546])
 
-    """nuscenes: x가 차 전진 방향, y는 차량 좌우 방향, z는 차 위아래 방향"""
-    # translation = [-0.008222580, -0.006377218, 0.040763527] # 원래
-    translation = [0.040763527, -0.008222580, -0.006377218]
+#     """nuscenes: x가 차 전진 방향, y는 차량 좌우 방향, z는 차 위아래 방향"""
+#     # translation = [-0.008222580, -0.006377218, 0.040763527] # 원래
+#     translation = [0.040763527, -0.008222580, -0.006377218]
 
-    data['img_metas'][0][0]['can_bus'][:3] = translation
-    data['img_metas'][0][0]['can_bus'][3:7] = rotation
+#     data['img_metas'][0][0]['can_bus'][:3] = translation
+#     data['img_metas'][0][0]['can_bus'][3:7] = rotation
 
-    patch_angle = quaternion_yaw(rotation) / np.pi * 180 # we get the yaw angle of ego car
-    if patch_angle < 0:
-        patch_angle += 360
-    data['img_metas'][0][0]['can_bus'][-2] = patch_angle / 180 * np.pi # this angle is kept unchanged.
-    data['img_metas'][0][0]['can_bus'][-1] = patch_angle # this angle is used to compute the detal of adjacent timestamps.
+#     patch_angle = quaternion_yaw(rotation) / np.pi * 180 # we get the yaw angle of ego car
+#     if patch_angle < 0:
+#         patch_angle += 360
+#     data['img_metas'][0][0]['can_bus'][-2] = patch_angle / 180 * np.pi # this angle is kept unchanged.
+#     data['img_metas'][0][0]['can_bus'][-1] = patch_angle # this angle is used to compute the detal of adjacent timestamps.
     
     
     
@@ -1165,14 +1162,14 @@ for image in images:
                 continue
 
             # Move box to global coord system
-            # box.rotate(pyquaternion.Quaternion(info['ego2global_rotation']))
-            # box.translate(np.array(info['ego2global_translation']))
+            box.rotate(pyquaternion.Quaternion(info['ego2global_rotation']))
+            box.translate(np.array(info['ego2global_translation']))
 
             """Ego pose 변경"""
-            rotation = [0.999514282, -0.009492505, -0.029651314, 0.001394546]
-            translation = [0.040763527, -0.008222580, -0.006377218]
-            box.rotate(pyquaternion.Quaternion(rotation))
-            box.translate(np.array(translation))
+            # rotation = [0.999514282, -0.009492505, -0.029651314, 0.001394546]
+            # translation = [0.040763527, -0.008222580, -0.006377218]
+            # box.rotate(pyquaternion.Quaternion(rotation))
+            # box.translate(np.array(translation))
 
             boxes.append(box)
 
@@ -1315,7 +1312,7 @@ for image in images:
 
         # nusc => tangent cam으로 변경
         data_path = tangent_cams[ind]
-        camera_intrinsic = np.array(tangent_intrinsics_for_vis[ind])
+        # camera_intrinsic = np.array(tangent_intrinsics_for_vis[ind])
         imsize = tangent_patch_size
 
         # print("data path", data_path)
@@ -1334,7 +1331,7 @@ for image in images:
                 # print("Current box before translation", box)
 
                 """기존 nuscenes"""
-                """
+                
                 # Move box to ego vehicle coord system. (pose record: ego2global)
                 box.translate(-np.array(pose_record['translation']))
                 box.rotate(Quaternion(pose_record['rotation']).inverse)
@@ -1349,7 +1346,7 @@ for image in images:
                 # print("ego2sensor", -np.array(cs_record['translation']), Quaternion(cs_record['rotation']).inverse)
                 # print("Current box after moving to camera coord system", box)
                 # print()
-                """
+                
 
                 """insta360 방안 1"""
                 # Move box to ego vehicle coord system. (pose record: ego2global)
@@ -1379,8 +1376,8 @@ for image in images:
                 """
 
                 """insta360 방안 2-2. nuscenes에서 sensor2ego rotation 및 translation 변경"""
-
-                """ego2global (pose) 변경"""
+                """
+                # ego2global (pose) 변경
                 # 1. Move box to ego vehicle coord system. (pose record: ego2global)
                 # box.translate(-np.array(pose_record['translation']))
                 # box.rotate(Quaternion(pose_record['rotation']).inverse)
@@ -1403,7 +1400,7 @@ for image in images:
 
                 # box.rotate(Quaternion(cs_record['rotation']).inverse)
                 box.rotate(Quaternion(matrix=sensor2ego_rotations[cam]).inverse)
-
+                """
 
             if not box_in_image(box, camera_intrinsic, imsize, vis_level=box_vis_level):
                 continue
